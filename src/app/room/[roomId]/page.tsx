@@ -41,8 +41,20 @@ export default function RoomPage({ params }: { params: { roomId: string } }) {
           setRoomStatus('error');
         });
 
-        socketRef.current.on('new-peer', (data: { peerId: string }) => {
+        socketRef.current.on('new-peer', async (data: { peerId: string }) => {
           setPeers((prev) => [...prev, data.peerId]);
+
+          // If we're already sharing, create a new offer for this peer
+          if (isSharing && localStream && peerConnectionRef.current) {
+            const offer = await peerConnectionRef.current.createOffer();
+            await peerConnectionRef.current.setLocalDescription(offer);
+
+            socketRef.current?.emit('offer', {
+              roomId,
+              offer,
+              targetPeerId: data.peerId,
+            });
+          }
         });
 
         socketRef.current.on('disconnect', () => {
@@ -59,9 +71,19 @@ export default function RoomPage({ params }: { params: { roomId: string } }) {
         });
         peerConnectionRef.current = pc;
 
+        // Connection state logging
+        pc.onconnectionstatechange = () => {
+          console.log('Connection state:', pc.connectionState);
+        };
+
+        pc.oniceconnectionstatechange = () => {
+          console.log('ICE connection state:', pc.iceConnectionState);
+        };
+
         // ICE candidate handling
         pc.onicecandidate = (event) => {
           if (event.candidate && socketRef.current) {
+            // Send to existing peers
             peers.forEach((peerId) => {
               socketRef.current?.emit('ice-candidate', {
                 roomId,
@@ -69,6 +91,22 @@ export default function RoomPage({ params }: { params: { roomId: string } }) {
                 targetPeerId: peerId,
               });
             });
+
+            // Set up listener for future peers
+            const newPeerHandler = (newPeerData: { peerId: string }) => {
+              socketRef.current?.emit('ice-candidate', {
+                roomId,
+                candidate: event.candidate,
+                targetPeerId: newPeerData.peerId,
+              });
+            };
+
+            socketRef.current.on('new-peer', newPeerHandler);
+
+            // Cleanup listener when component unmounts
+            return () => {
+              socketRef.current?.off('new-peer', newPeerHandler);
+            };
           }
         };
 
@@ -77,6 +115,22 @@ export default function RoomPage({ params }: { params: { roomId: string } }) {
           if (remoteVideoRef.current && event.streams.length > 0) {
             remoteVideoRef.current.srcObject = event.streams[0];
             setRemoteStream(event.streams[0]);
+          }
+        };
+
+        // Handle renegotiation needed
+        pc.onnegotiationneeded = async () => {
+          if (peers.length > 0 && peerConnectionRef.current) {
+            const offer = await peerConnectionRef.current.createOffer();
+            await peerConnectionRef.current.setLocalDescription(offer);
+
+            peers.forEach((peerId) => {
+              socketRef.current?.emit('offer', {
+                roomId,
+                offer,
+                targetPeerId: peerId,
+              });
+            });
           }
         };
 
@@ -149,10 +203,14 @@ export default function RoomPage({ params }: { params: { roomId: string } }) {
 
   const startSharing = async () => {
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        audio: true,
-      });
+      const stream = await navigator.mediaDevices
+        .getDisplayMedia({
+          video: true,
+          audio: true,
+        })
+        .catch((err) => {
+          throw new Error(`Could not get display media: ${err.message}`);
+        });
 
       if (localVideoRef.current) {
         localVideoRef.current.srcObject = stream;
@@ -260,7 +318,6 @@ export default function RoomPage({ params }: { params: { roomId: string } }) {
           </div>
         </div>
 
-        {/* Remote Screen */}
         <div className='flex-1 bg-white p-4 rounded-lg shadow'>
           <h2 className='text-xl font-semibold mb-4'>Remote Screen</h2>
           <video
